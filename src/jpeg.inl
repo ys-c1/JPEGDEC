@@ -21,6 +21,7 @@
 //===========================================================================
 //
 #include "JPEGDEC.h"
+#include <math.h> // for pow() in JPEG_setColorOptions()
 
 #ifdef TEENSYDUINO
 #include "my_cm4_simd.h"
@@ -562,6 +563,69 @@ static const uint16_t usRangeTableB[] = {0x0000,0x0000,0x0000,0x0000,0x0000,0x00
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+//
+// Extended color-space support (CMYK / YCCK / gray+alpha -> RGB)
+//
+// Detected color spaces (returned by JPEG_getColorSpace)
+enum {
+    JPEG_CS_UNKNOWN = 0,
+    JPEG_CS_GRAYSCALE,      // 1 component
+    JPEG_CS_GRAY_ALPHA,     // 2 components (luma + alpha)
+    JPEG_CS_YCBCR,          // 3 components
+    JPEG_CS_CMYK,           // 4 components (Adobe transform 0 or no APP14)
+    JPEG_CS_YCCK            // 4 components (Adobe transform 2)
+};
+// These values describe the most recently opened image; they are set by
+// JPEGParseInfo() and consumed by DecodeJPEG(). User color options persist
+// across images until changed with JPEG_setColorOptions().
+static uint8_t s_ucColorSpace = JPEG_CS_UNKNOWN;
+static uint8_t s_ucAdobeTransform = 0xff; // APP14 transform flag (0xff = no Adobe marker)
+static int s_iGamma100 = 100;    // gray->RGB output gamma * 100 (100 = linear)
+static int s_iKeyCoeff100 = 100; // CMYK/YCCK key-plate blend coefficient * 100
+static uint8_t s_ucGammaLUT[256]; // gray->RGB gamma lookup (valid when s_iGamma100 != 100)
+static uint16_t s_usGamma565[256]; // s_ucGammaLUT precomposed to RGB565LE pixels
+static uint32_t s_ulGammaRGB[256]; // s_ucGammaLUT precomposed to RGB8888 pixels
+static uint8_t s_ucKeyTermAdobe[256]; // CMYK/YCCK key term, indexed by stored (inverted-ink) K byte
+static uint8_t s_ucKeyTermPlain[256]; // same for non-Adobe files (plain ink K byte)
+static uint8_t s_bKeyTermReady = 0;
+//
+// JPEG_setColorOptions()
+// Configure the gray->RGB gamma and the CMYK/YCCK key-plate coefficient.
+// iGamma100:   output gamma * 100 applied to grayscale->RGB conversion
+//              (100 = linear/identity, 220 = gamma 2.2). Valid range 20..1000.
+// iKeyCoeff100: scales the K (key) plate contribution to the CMYK/YCCK blend
+//              in percent (100 = full ICC-fallback formula, 0 = ignore key).
+//              Valid range 0..200.
+// Returns 1 if the options were accepted, 0 if a value is out of range.
+//
+int JPEG_setColorOptions(int iGamma100, int iKeyCoeff100)
+{
+    if (iGamma100 < 20 || iGamma100 > 1000 || iKeyCoeff100 < 0 || iKeyCoeff100 > 200)
+        return 0; // out of range
+    s_iGamma100 = iGamma100;
+    s_iKeyCoeff100 = iKeyCoeff100;
+    s_bKeyTermReady = 0; // rebuild the key-term LUT on next use
+    if (iGamma100 != 100) { // (re)build the gamma lookup tables
+        int i, g;
+        double dGamma = 100.0 / (double)iGamma100;
+        for (i = 0; i < 256; i++) {
+            double d = 255.0 * pow((double)i / 255.0, dGamma);
+            g = (int)(d + 0.5);
+            s_ucGammaLUT[i] = (uint8_t)g;
+            s_ulGammaRGB[i] = 0xff000000 | ((uint32_t)g * 0x01010101);
+            s_usGamma565[i] = (uint16_t)(((g & 0xf8) << 8) | ((g & 0xfc) << 3) | (g >> 3));
+        }
+    }
+    return 1;
+} /* JPEG_setColorOptions() */
+//
+// JPEG_getColorSpace()
+// Returns the JPEG_CS_* colorspace of the most recently opened image.
+//
+int JPEG_getColorSpace(void)
+{
+    return (int)s_ucColorSpace;
+} /* JPEG_getColorSpace() */
 #if defined (__MACH__) || defined( __LINUX__ ) || defined( __MCUXPRESSO ) || defined(_WIN64)
 //
 // API for C
@@ -1590,6 +1654,8 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
     int iFilePos = 0;
     
     pPage->pFramebuffer = NULL; // this must be set AFTER calling this function
+    s_ucColorSpace = JPEG_CS_UNKNOWN; // reset per-image color info
+    s_ucAdobeTransform = 0xff; // no Adobe APP14 marker seen yet
     // make sure usPixels is 16-byte aligned for S3 SIMD (and possibly others)
     i = (int)(int64_t)pPage->usUnalignedPixels;
     i &= 15;
@@ -1662,7 +1728,16 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
             case 0xffc3: // lossless mode
                 pPage->iError = JPEG_UNSUPPORTED_FEATURE;
                 return 0; // currently unsupported modes
-                
+
+            case 0xffee: // APP14 (Adobe?)
+                // payload: "Adobe" + 2-byte version + 2x2-byte flags + 1-byte transform
+                if (usLen >= 14 && s[iOffset+2] == 'A' && s[iOffset+3] == 'd' &&
+                    s[iOffset+4] == 'o' && s[iOffset+5] == 'b' && s[iOffset+6] == 'e')
+                {
+                    s_ucAdobeTransform = s[iOffset+13]; // 0=CMYK/RGB, 1=YCbCr, 2=YCCK
+                }
+                break;
+
             case 0xffe1: // App1 (EXIF?)
                 if (s[iOffset+2] == 'E' && s[iOffset+3] == 'x' && (s[iOffset+8] == 'M' || s[iOffset+8] == 'I')) // the EXIF data we want
                 {
@@ -1782,6 +1857,22 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
     } // while
     if (usMarker == 0xffda) // start of image
     {
+        // classify the color space of this image
+        switch (pPage->ucNumComponents)
+        {
+            case 1: s_ucColorSpace = JPEG_CS_GRAYSCALE; break;
+            case 2: s_ucColorSpace = JPEG_CS_GRAY_ALPHA; break;
+            case 3: // Adobe transform 0 means the planes are RGB, not YCbCr
+                s_ucColorSpace = (s_ucAdobeTransform == 0) ? JPEG_CS_UNKNOWN : JPEG_CS_YCBCR;
+                break;
+            case 4:
+                if (s_ucAdobeTransform == 2)
+                    s_ucColorSpace = JPEG_CS_YCCK;
+                else if (s_ucAdobeTransform == 0 || s_ucAdobeTransform == 0xff)
+                    s_ucColorSpace = JPEG_CS_CMYK;
+                // any other Adobe transform value for 4 components is unsupported
+                break;
+        }
 //        if (pPage->ucBpp != 8) // need to match up table IDs
 //        {
             iOffset -= usLen;
@@ -3056,13 +3147,341 @@ static void JPEGPutMCU8BitGray(JPEGIMAGE *pJPEG, int x, int iPitch)
     } // 0x22
 } /* JPEGMPutMCU8BitGray() */
 
+//
+// CMYK/YCCK -> RGB using the ICC-fallback blend formula.
+// iC is the "white-ness" of a color channel (Adobe: the stored inverted-ink
+// byte; non-Adobe: 255 minus the stored ink byte; YCCK: 255 minus the
+// YCbCr->RGB value) and iKTerm is the key term in the same domain
+// (255 = no key contribution).
+// out = round(iC * iKTerm / 255), matching the libjpeg/Pillow pipeline.
+// The blend uses the exact identity round(u/255) == ((u+128)*257)>>16 for
+// u in [0, 65025] (verified for the full range).
+//
+#define CMYK_BLEND(iR, iG, iB, iKTerm)              \
+    {                                             \
+        int iK_ = (iKTerm);                       \
+        iR = ((iR * iK_ + 128) * 257) >> 16;      \
+        iG = ((iG * iK_ + 128) * 257) >> 16;      \
+        iB = ((iB * iK_ + 128) * 257) >> 16;      \
+    }
+static void JPEGBuildKeyTerm(void)
+{
+    int i;
+    for (i = 0; i < 256; i++) {
+        // key term = 255 - round(ink * coeff / 100), indexed by stored byte
+        s_ucKeyTermAdobe[i] = (uint8_t)(255 - ((255 - i) * s_iKeyCoeff100 + 50) / 100);
+        s_ucKeyTermPlain[i] = (uint8_t)(255 - (i * s_iKeyCoeff100 + 50) / 100);
+    }
+    s_bKeyTermReady = 1;
+} /* JPEGBuildKeyTerm() */
+//
+// The four pixel-output loops shared by the 4-color specializations.
+// PREP must compute iR/iG/iB (whiteness domain, pre-blend) from pC0[j]..pC3[j]
+// and perform the key blend.
+//
+#define PUT_4COLOR_LOOPS(PREP)                                                \
+    if (pJPEG->ucPixelType == RGB8888) {                                      \
+        uint32_t *pOut = (uint32_t *)&pJPEG->usPixels[x*2];                   \
+        for (i = 0; i < 8; i++) {                                             \
+            for (j = 0; j < xcount; j++) {                                    \
+                int iR, iG, iB;                                               \
+                PREP;                                                         \
+                pOut[j] = 0xff000000 | (uint32_t)iR | ((uint32_t)iG << 8)     \
+                          | ((uint32_t)iB << 16);                             \
+            }                                                                 \
+            pC0 += 8; pC1 += 8; pC2 += 8; pC3 += 8;                           \
+            pOut += iPitch;                                                   \
+        }                                                                     \
+    } else if (pJPEG->ucPixelType == EIGHT_BIT_GRAYSCALE) {                   \
+        uint8_t *pOut = (uint8_t *)&pJPEG->usPixels[0] + x;                   \
+        for (i = 0; i < 8; i++) {                                             \
+            for (j = 0; j < xcount; j++) {                                    \
+                int iR, iG, iB;                                               \
+                PREP;                                                         \
+                pOut[j] = (uint8_t)((iR * 77 + iG * 150 + iB * 29 + 128) >> 8); \
+            }                                                                 \
+            pC0 += 8; pC1 += 8; pC2 += 8; pC3 += 8;                           \
+            pOut += iPitch;                                                   \
+        }                                                                     \
+    } else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN) {                     \
+        uint16_t *pOut = &pJPEG->usPixels[x];                                 \
+        for (i = 0; i < 8; i++) {                                             \
+            for (j = 0; j < xcount; j++) {                                    \
+                int iR, iG, iB;                                               \
+                PREP;                                                         \
+                pOut[j] = __builtin_bswap16((uint16_t)(((iR & 0xf8) << 8)      \
+                          | ((iG & 0xfc) << 3) | (iB >> 3)));                 \
+            }                                                                 \
+            pC0 += 8; pC1 += 8; pC2 += 8; pC3 += 8;                           \
+            pOut += iPitch;                                                   \
+        }                                                                     \
+    } else { /* RGB565 little endian */                                       \
+        uint16_t *pOut = &pJPEG->usPixels[x];                                 \
+        for (i = 0; i < 8; i++) {                                             \
+            for (j = 0; j < xcount; j++) {                                    \
+                int iR, iG, iB;                                               \
+                PREP;                                                         \
+                pOut[j] = (uint16_t)(((iR & 0xf8) << 8) | ((iG & 0xfc) << 3)  \
+                          | (iB >> 3));                                       \
+            }                                                                 \
+            pC0 += 8; pC1 += 8; pC2 += 8; pC3 += 8;                           \
+            pOut += iPitch;                                                   \
+        }                                                                     \
+    }
+#define PUT_4COLOR_HEAD \
+    int i, j;                                                        \
+    uint8_t *pC0 = (uint8_t *)&pJPEG->sMCUs[MCU0];                   \
+    uint8_t *pC1 = (uint8_t *)&pJPEG->sMCUs[MCU1];                   \
+    uint8_t *pC2 = (uint8_t *)&pJPEG->sMCUs[MCU2];                   \
+    uint8_t *pC3 = (uint8_t *)&pJPEG->sMCUs[MCU3]
+// Adobe CMYK: stored bytes are inverted ink
+#define PREP_ADOBE_CMYK                                               \
+    iR = pC0[j]; iG = pC1[j]; iB = pC2[j];                            \
+    CMYK_BLEND(iR, iG, iB, s_ucKeyTermAdobe[pC3[j]])
+// non-Adobe CMYK: stored bytes are plain ink amounts
+#define PREP_PLAIN_CMYK                                               \
+    iR = 255 - pC0[j]; iG = 255 - pC1[j]; iB = 255 - pC2[j];          \
+    CMYK_BLEND(iR, iG, iB, s_ucKeyTermPlain[pC3[j]])
+// YCCK: Y,Cb,Cr become the ink amounts (libjpeg-compatible math);
+// the blend works on whiteness (255 - ink)
+#define PREP_YCCK                                                     \
+    {                                                                 \
+        int iCb = pC1[j] - 128, iCr = pC2[j] - 128;                   \
+        iR = pC0[j] + ((91881 * iCr + 32768) >> 16);                  \
+        iG = pC0[j] + ((-22554 * iCb - 46802 * iCr + 32768) >> 16);   \
+        iB = pC0[j] + ((116130 * iCb + 32768) >> 16);                 \
+        if (iR < 0) iR = 0; else if (iR > 255) iR = 255;              \
+        if (iG < 0) iG = 0; else if (iG > 255) iG = 255;              \
+        if (iB < 0) iB = 0; else if (iB > 255) iB = 255;              \
+        iR = 255 - iR; iG = 255 - iG; iB = 255 - iB;                  \
+        CMYK_BLEND(iR, iG, iB, s_ucKeyTermAdobe[pC3[j]]);             \
+    }
+static void JPEGPutMCU4ColorAdobe(JPEGIMAGE *pJPEG, int x, int iPitch, int xcount)
+{
+    PUT_4COLOR_HEAD;
+#ifdef HAS_SSE
+    // SSE2 fast path: Adobe CMYK -> RGB8888 with the default key coefficient
+    // (key term = stored K byte). 8 pixels per iteration using the exact
+    // identity round(u/255) == ((u+128)*257)>>16 for u in [0, 65025].
+    if (pJPEG->ucPixelType == RGB8888 && s_iKeyCoeff100 == 100 && xcount == 8) {
+        uint32_t *pOut = (uint32_t *)&pJPEG->usPixels[x*2];
+        const __m128i mm128 = _mm_set1_epi16(128);
+        const __m128i mm257 = _mm_set1_epi16(257);
+        const __m128i mmA = _mm_set1_epi16(-1); // 0xff alpha bytes
+        const __m128i mmZero = _mm_setzero_si128();
+        for (i = 0; i < 8; i++) { // 8 rows
+            __m128i mmR, mmG, mmB, mmRG, mmBA;
+            __m128i mmC = _mm_unpacklo_epi8(_mm_loadl_epi64((__m128i *)pC0), mmZero);
+            __m128i mmM = _mm_unpacklo_epi8(_mm_loadl_epi64((__m128i *)pC1), mmZero);
+            __m128i mmY = _mm_unpacklo_epi8(_mm_loadl_epi64((__m128i *)pC2), mmZero);
+            __m128i mmK = _mm_unpacklo_epi8(_mm_loadl_epi64((__m128i *)pC3), mmZero);
+            mmR = _mm_mullo_epi16(mmC, mmK); // c*k (<= 65025, fits u16)
+            mmG = _mm_mullo_epi16(mmM, mmK);
+            mmB = _mm_mullo_epi16(mmY, mmK);
+            mmR = _mm_mulhi_epu16(_mm_add_epi16(mmR, mm128), mm257);
+            mmG = _mm_mulhi_epu16(_mm_add_epi16(mmG, mm128), mm257);
+            mmB = _mm_mulhi_epu16(_mm_add_epi16(mmB, mm128), mm257);
+            mmR = _mm_packus_epi16(mmR, mmR); // 8 bytes in the low half
+            mmG = _mm_packus_epi16(mmG, mmG);
+            mmB = _mm_packus_epi16(mmB, mmB);
+            mmRG = _mm_unpacklo_epi8(mmR, mmG); // R0 G0 R1 G1 ...
+            mmBA = _mm_unpacklo_epi8(mmB, mmA); // B0 A0 B1 A1 ...
+            _mm_storeu_si128((__m128i *)&pOut[0], _mm_unpacklo_epi16(mmRG, mmBA));
+            _mm_storeu_si128((__m128i *)&pOut[4], _mm_unpackhi_epi16(mmRG, mmBA));
+            pC0 += 8; pC1 += 8; pC2 += 8; pC3 += 8;
+            pOut += iPitch;
+        }
+        return;
+    }
+#endif // HAS_SSE
+    PUT_4COLOR_LOOPS(PREP_ADOBE_CMYK)
+} /* JPEGPutMCU4ColorAdobe() */
+static void JPEGPutMCU4ColorPlain(JPEGIMAGE *pJPEG, int x, int iPitch, int xcount)
+{
+    PUT_4COLOR_HEAD;
+    PUT_4COLOR_LOOPS(PREP_PLAIN_CMYK)
+} /* JPEGPutMCU4ColorPlain() */
+static void JPEGPutMCU4ColorYCCK(JPEGIMAGE *pJPEG, int x, int iPitch, int xcount)
+{
+    PUT_4COLOR_HEAD;
+    PUT_4COLOR_LOOPS(PREP_YCCK)
+} /* JPEGPutMCU4ColorYCCK() */
+//
+// Draw a 4-component (CMYK or YCCK) MCU as RGB565/RGB8888/8-bit gray
+// Full resolution only; all 4 planes are 8x8 bytes at MCU0..MCU3
+//
+static void JPEGPutMCU4Color(JPEGIMAGE *pJPEG, int x, int iPitch)
+{
+    int xcount = 8;
+
+    if (!s_bKeyTermReady)
+        JPEGBuildKeyTerm();
+    if (x + 8 > iPitch) // final block is partial width
+        xcount = iPitch - x;
+    if (s_ucColorSpace == JPEG_CS_YCCK)
+        JPEGPutMCU4ColorYCCK(pJPEG, x, iPitch, xcount);
+    else if (s_ucAdobeTransform != 0xff) // Adobe stores inverted ink
+        JPEGPutMCU4ColorAdobe(pJPEG, x, iPitch, xcount);
+    else
+        JPEGPutMCU4ColorPlain(pJPEG, x, iPitch, xcount);
+} /* JPEGPutMCU4Color() */
+//
+// Draw a 2-component (grayscale + alpha) MCU as RGB565 or RGBA8888
+// Full resolution only; gray plane at MCU0, alpha plane at MCU1
+//
+static void JPEGPutMCUGrayAlpha(JPEGIMAGE *pJPEG, int x, int iPitch)
+{
+    int i, j, xcount, delta;
+    const int bGamma = (s_iGamma100 != 100);
+    uint8_t *pG = (uint8_t *)&pJPEG->sMCUs[MCU0];
+    uint8_t *pA = (uint8_t *)&pJPEG->sMCUs[MCU1];
+    uint16_t *pOutput = &pJPEG->usPixels[x];
+    uint32_t *pOutput32 = (uint32_t *)&pJPEG->usPixels[x*2];
+
+    xcount = 8;
+    delta = 0;
+    if (x + 8 > iPitch) { // final block is partial width
+        xcount = iPitch - x;
+        delta = 8 - xcount;
+    }
+    for (i = 0; i < 8; i++) { // 8 rows
+        for (j = 0; j < xcount; j++) {
+            uint8_t g = *pG++, a = *pA++;
+            if (bGamma)
+                g = s_ucGammaLUT[g];
+            if (pJPEG->ucPixelType == RGB8888) {
+                pOutput32[j] = ((uint32_t)a << 24) | ((uint32_t)g * 0x010101);
+            } else { // RGB565 (alpha dropped)
+                uint16_t us = usGrayTo565[g];
+                if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN)
+                    us = __builtin_bswap16(us);
+                pOutput[j] = us;
+            }
+        } // for j
+        pG += delta; pA += delta;
+        pOutput += iPitch; pOutput32 += iPitch;
+    } // for i
+} /* JPEGPutMCUGrayAlpha() */
+//
+// Draw a grayscale MCU as RGB with the gamma LUT applied to every gray level
+// (mirrors the traversal of JPEGPutMCUGray, including the scaling options)
+//
+static void JPEGPutMCUGrayGamma(JPEGIMAGE *pJPEG, int x, int iPitch)
+{
+    int i, j, xcount, ycount, delta;
+    uint8_t *pSrc = (uint8_t *)&pJPEG->sMCUs[0];
+
+    if (pJPEG->iOptions & JPEG_SCALE_HALF) { // 1/2 size (pixel averaging)
+        int pix;
+        if (pJPEG->ucPixelType == RGB8888) {
+            uint32_t *ulDest = (uint32_t *)&pJPEG->usPixels[x*2];
+            for (i = 0; i < 4; i++) {
+                for (j = 0; j < 4; j++) {
+                    pix = (pSrc[0] + pSrc[1] + pSrc[8] + pSrc[9] + 2) >> 2;
+                    ulDest[j] = s_ulGammaRGB[pix];
+                    pSrc += 2;
+                }
+                pSrc += 8; // skip extra line
+                ulDest += iPitch;
+            }
+        } else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN) {
+            uint16_t *usDest = (uint16_t *)&pJPEG->usPixels[x];
+            for (i = 0; i < 4; i++) {
+                for (j = 0; j < 4; j++) {
+                    pix = (pSrc[0] + pSrc[1] + pSrc[8] + pSrc[9] + 2) >> 2;
+                    usDest[j] = __builtin_bswap16(s_usGamma565[pix]);
+                    pSrc += 2;
+                }
+                pSrc += 8;
+                usDest += iPitch;
+            }
+        } else { // RGB565 little endian
+            uint16_t *usDest = (uint16_t *)&pJPEG->usPixels[x];
+            for (i = 0; i < 4; i++) {
+                for (j = 0; j < 4; j++) {
+                    pix = (pSrc[0] + pSrc[1] + pSrc[8] + pSrc[9] + 2) >> 2;
+                    usDest[j] = s_usGamma565[pix];
+                    pSrc += 2;
+                }
+                pSrc += 8;
+                usDest += iPitch;
+            }
+        }
+        return;
+    }
+    xcount = ycount = 8;
+    delta = 0;
+    if (pJPEG->iOptions & JPEG_SCALE_QUARTER) {
+        xcount = ycount = 2;
+    } else if (pJPEG->iOptions & JPEG_SCALE_EIGHTH) {
+        xcount = ycount = 1;
+    } else if (x + 8 > iPitch) {
+        xcount = iPitch - x; // final block is partial width
+        delta = 8 - xcount;
+    }
+    if (pJPEG->ucPixelType == RGB8888) {
+        uint32_t *ulDest = (uint32_t *)&pJPEG->usPixels[x*2];
+        for (i = 0; i < ycount; i++) { // do up to 8 rows
+            if (xcount == 8) { // full row: source is contiguous, unroll
+                uint32_t u0 = ((uint32_t *)pSrc)[0];
+                uint32_t u1 = ((uint32_t *)pSrc)[1];
+                pSrc += 8;
+                ulDest[0] = s_ulGammaRGB[u0 & 0xff];
+                ulDest[1] = s_ulGammaRGB[(u0 >> 8) & 0xff];
+                ulDest[2] = s_ulGammaRGB[(u0 >> 16) & 0xff];
+                ulDest[3] = s_ulGammaRGB[u0 >> 24];
+                ulDest[4] = s_ulGammaRGB[u1 & 0xff];
+                ulDest[5] = s_ulGammaRGB[(u1 >> 8) & 0xff];
+                ulDest[6] = s_ulGammaRGB[(u1 >> 16) & 0xff];
+                ulDest[7] = s_ulGammaRGB[u1 >> 24];
+            } else {
+                for (j = 0; j < xcount; j++)
+                    ulDest[j] = s_ulGammaRGB[*pSrc++];
+                pSrc += delta;
+            }
+            ulDest += iPitch;
+        }
+    } else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN) {
+        uint16_t *usDest = (uint16_t *)&pJPEG->usPixels[x];
+        for (i = 0; i < ycount; i++) {
+            for (j = 0; j < xcount; j++)
+                usDest[j] = __builtin_bswap16(s_usGamma565[*pSrc++]);
+            pSrc += delta;
+            usDest += iPitch;
+        }
+    } else { // RGB565 little endian
+        uint16_t *usDest = (uint16_t *)&pJPEG->usPixels[x];
+        for (i = 0; i < ycount; i++) {
+            if (xcount == 8) { // full row: unroll with 32-bit stores
+                uint32_t u0 = ((uint32_t *)pSrc)[0];
+                uint32_t u1 = ((uint32_t *)pSrc)[1];
+                uint32_t *pD32 = (uint32_t *)usDest;
+                pSrc += 8;
+                pD32[0] = (uint32_t)s_usGamma565[u0 & 0xff] | ((uint32_t)s_usGamma565[(u0 >> 8) & 0xff] << 16);
+                pD32[1] = (uint32_t)s_usGamma565[(u0 >> 16) & 0xff] | ((uint32_t)s_usGamma565[u0 >> 24] << 16);
+                pD32[2] = (uint32_t)s_usGamma565[u1 & 0xff] | ((uint32_t)s_usGamma565[(u1 >> 8) & 0xff] << 16);
+                pD32[3] = (uint32_t)s_usGamma565[(u1 >> 16) & 0xff] | ((uint32_t)s_usGamma565[u1 >> 24] << 16);
+            } else {
+                for (j = 0; j < xcount; j++)
+                    usDest[j] = s_usGamma565[*pSrc++];
+                pSrc += delta;
+            }
+            usDest += iPitch;
+        }
+    }
+} /* JPEGPutMCUGrayGamma() */
+
 static void JPEGPutMCUGray(JPEGIMAGE *pJPEG, int x, int iPitch)
 {
     uint16_t *usDest = (uint16_t *)&pJPEG->usPixels[x];
     uint32_t *ulDest = (uint32_t *)&pJPEG->usPixels[x*2];
     int i, j, xcount, ycount, delta;
     uint8_t *pSrc = (uint8_t *)&pJPEG->sMCUs[0];
-    
+
+    if (s_iGamma100 != 100) { // gamma-corrected gray->RGB requested
+        JPEGPutMCUGrayGamma(pJPEG, x, iPitch);
+        return;
+    }
     if (pJPEG->iOptions & JPEG_SCALE_HALF) { // special handling of 1/2 size (pixel averaging)
         int pix;
         for (i=0; i<4; i++) {
@@ -5022,9 +5441,9 @@ uint8_t pixelmask=0, shift=0;
 static int DecodeJPEG(JPEGIMAGE *pJPEG)
 {
     int cx, cy, x, y, mcuCX, mcuCY;
-    int iLum0, iLum1, iLum2, iLum3, iCr, iCb;
-    signed int iDCPred0, iDCPred1, iDCPred2;
-    int i, iQuant1, iQuant2, iQuant3, iErr;
+    int iLum0, iLum1, iLum2, iLum3, iCr, iCb, iK;
+    signed int iDCPred0, iDCPred1, iDCPred2, iDCPred3;
+    int i, iQuant1, iQuant2, iQuant3, iQuant4, iErr;
     int iSkipMask, bSkipRow;
     int iDMASize, iDMAOffset;
     uint16_t *pAlignedPixels = pJPEG->usPixels;
@@ -5032,7 +5451,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     int iMCUCount, xoff, iPitch, bThumbnail = 0;
     int bContinue = 1; // early exit if the DRAW callback wants to stop
     uint32_t l, *pl;
-    unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2;
+    unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2, cDCTable3, cACTable3;
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
 
@@ -5067,6 +5486,26 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     if (pJPEG->iOptions & JPEG_LUMA_ONLY && pJPEG->ucPixelType < EIGHT_BIT_GRAYSCALE) {
         pJPEG->ucPixelType = EIGHT_BIT_GRAYSCALE; // switch to grayscale output
     }
+    // Validate the color-space specific restrictions before doing any work
+    if (pJPEG->ucNumComponents == 4) {
+        if (s_ucColorSpace == JPEG_CS_UNKNOWN || // unsupported Adobe transform
+            pJPEG->ucSubSample != 0x11 || // subsampled 4-plane images are unsupported
+            pJPEG->ucPixelType > EIGHT_BIT_GRAYSCALE || // dithered output is unsupported
+            (pJPEG->iOptions & (JPEG_SCALE_HALF | JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH))) {
+            pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+            return 0;
+        }
+    } else if (pJPEG->ucNumComponents == 2) {
+        if (pJPEG->ucSubSample != 0x11 || // subsampled 2-plane images are unsupported
+            (pJPEG->ucPixelType < EIGHT_BIT_GRAYSCALE && // scaled RGB output is unsupported
+             (pJPEG->iOptions & (JPEG_SCALE_HALF | JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH)))) {
+            pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+            return 0;
+        }
+    } else if (pJPEG->ucNumComponents == 3 && s_ucAdobeTransform == 0) {
+        pJPEG->iError = JPEG_UNSUPPORTED_FEATURE; // 3-plane RGB images are unsupported
+        return 0;
+    }
     // reorder and fix the quantization table for decoding
     JPEGFixQuantD(pJPEG);
     pJPEG->bb.ulBits = MOTOLONG(&pJPEG->ucFileBuf[0]); // preload first 4/8 bytes
@@ -5079,7 +5518,9 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     cACTable1 = pJPEG->JPCI[1].ac_tbl_no;
     cDCTable2 = pJPEG->JPCI[2].dc_tbl_no;
     cACTable2 = pJPEG->JPCI[2].ac_tbl_no;
-    iDCPred0 = iDCPred1 = iDCPred2 = mcuCX = mcuCY = 0;
+    cDCTable3 = pJPEG->JPCI[3].dc_tbl_no;
+    cACTable3 = pJPEG->JPCI[3].ac_tbl_no;
+    iDCPred0 = iDCPred1 = iDCPred2 = iDCPred3 = mcuCX = mcuCY = 0;
     
     switch (pJPEG->ucSubSample) // set up the parameters for the different subsampling options
     {
@@ -5090,6 +5531,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             cy = (pJPEG->iCropY + pJPEG->iCropCY + 7) >> 3;
             iCr = MCU1;
             iCb = MCU2;
+            iK = MCU3;
             mcuCX = mcuCY = 8;
             break;
         case 0x12:
@@ -5097,6 +5539,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             cy = (pJPEG->iCropY + pJPEG->iCropCY + 15) >> 4;
             iCr = MCU2;
             iCb = MCU3;
+            iK = 0;
             mcuCX = 8;
             mcuCY = 16;
             break;
@@ -5105,6 +5548,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             cy = (pJPEG->iCropY + pJPEG->iCropCY + 7) >> 3;
             iCr = MCU2;
             iCb = MCU3;
+            iK = 0;
             mcuCX = 16;
             mcuCY = 8;
             break;
@@ -5113,20 +5557,22 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             cy = (pJPEG->iCropY + pJPEG->iCropCY + 15) >> 4;
             iCr = MCU4;
             iCb = MCU5;
+            iK = 0;
             mcuCX = mcuCY = 16;
             break;
         default: // to suppress compiler warning
             cx = cy = 0;
-            iCr = iCb = 0;
+            iCr = iCb = iK = 0;
             break;
     }
     // Scale down the MCUs by the requested amount
     mcuCX >>= iScaleShift;
     mcuCY >>= iScaleShift;
-    
+
     iQuant1 = pJPEG->sQuantTable[pJPEG->JPCI[0].quant_tbl_no*DCTSIZE]; // DC quant values
     iQuant2 = pJPEG->sQuantTable[pJPEG->JPCI[1].quant_tbl_no*DCTSIZE];
     iQuant3 = pJPEG->sQuantTable[pJPEG->JPCI[2].quant_tbl_no*DCTSIZE];
+    iQuant4 = pJPEG->sQuantTable[pJPEG->JPCI[3].quant_tbl_no*DCTSIZE];
     // luminance values are always in these positions
     iLum0 = MCU0;
     iLum1 = MCU1;
@@ -5293,19 +5739,22 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     }
                 } // if 2:2 subsampling
             } // if subsampling used
-            if (pJPEG->ucSubSample && pJPEG->ucNumComponents == 3) // if color (not CMYK)
+            if (pJPEG->ucSubSample && pJPEG->ucNumComponents >= 2) // additional color planes present
             {
-                // first chroma
+                // first chroma (or alpha)
                 pJPEG->ucACTable = cACTable1;
                 pJPEG->ucDCTable = cDCTable1;
-                if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
-                    // We're not going to use the color channels, so avoid as much work as possible
+                if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE && pJPEG->ucNumComponents != 4) {
+                    // We're not going to use the color/alpha channels, so avoid as much work as possible
+                    // (CMYK/YCCK needs all 4 planes even for grayscale output)
                     if (pJPEG->ucMode == 0xc2) { // progressive
                         iErr |= JPEGDecodeMCU_P(pJPEG, MCU_SKIP, &iDCPred1);
-                        iErr |= JPEGDecodeMCU_P(pJPEG, MCU_SKIP, &iDCPred2);
+                        if (pJPEG->ucNumComponents >= 3)
+                            iErr |= JPEGDecodeMCU_P(pJPEG, MCU_SKIP, &iDCPred2);
                     } else {
                         iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred1); // decode Cr block
-                        iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2); // decode Cb block
+                        if (pJPEG->ucNumComponents >= 3)
+                            iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2); // decode Cb block
                     }
                 } else {
                     if (pJPEG->ucMode == 0xc2) { // progressive
@@ -5326,31 +5775,60 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     {
                         JPEGIDCT(pJPEG, iCr, pJPEG->JPCI[1].quant_tbl_no); // second quantization table
                     }
-                    // second chroma
-                    pJPEG->ucACTable = cACTable2;
-                    pJPEG->ucDCTable = cDCTable2;
-                    if (pJPEG->ucMode == 0xc2) { // progressive
-                        iErr |= JPEGDecodeMCU_P(pJPEG, iCb | iSkipMask, &iDCPred2);
-                    } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iCb | iSkipMask, &iDCPred2);
+                    if (pJPEG->ucNumComponents >= 3) {
+                        // second chroma
+                        pJPEG->ucACTable = cACTable2;
+                        pJPEG->ucDCTable = cDCTable2;
+                        if (pJPEG->ucMode == 0xc2) { // progressive
+                            iErr |= JPEGDecodeMCU_P(pJPEG, iCb | iSkipMask, &iDCPred2);
+                        } else {
+                            iErr |= JPEGDecodeMCU(pJPEG, iCb | iSkipMask, &iDCPred2);
+                        }
+                        if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
+                        {
+                            c = ucRangeTable[((iDCPred2 * iQuant3) >> 5) & 0x3ff];
+                            l = c | ((uint32_t) c << 8) | ((uint32_t) c << 16) | ((uint32_t) c << 24);
+                            // dct stores byte values
+                            pl = (uint32_t *)&pJPEG->sMCUs[iCb];
+                            for (i = 0; i<iMaxFill; i++) // 8x8 bytes = 16 longs
+                                pl[i] = l;
+                        }
+                        else
+                        {
+                            JPEGIDCT(pJPEG, iCb, pJPEG->JPCI[2].quant_tbl_no);
+                        }
                     }
-                    if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
-                    {
-                        c = ucRangeTable[((iDCPred2 * iQuant3) >> 5) & 0x3ff];
-                        l = c | ((uint32_t) c << 8) | ((uint32_t) c << 16) | ((uint32_t) c << 24);
-                        // dct stores byte values
-                        pl = (uint32_t *)&pJPEG->sMCUs[iCb];
-                        for (i = 0; i<iMaxFill; i++) // 8x8 bytes = 16 longs
-                            pl[i] = l;
-                    }
-                    else
-                    {
-                        JPEGIDCT(pJPEG, iCb, pJPEG->JPCI[2].quant_tbl_no);
+                    if (pJPEG->ucNumComponents == 4) {
+                        // fourth plane (key)
+                        pJPEG->ucACTable = cACTable3;
+                        pJPEG->ucDCTable = cDCTable3;
+                        if (pJPEG->ucMode == 0xc2) { // progressive
+                            iErr |= JPEGDecodeMCU_P(pJPEG, iK | iSkipMask, &iDCPred3);
+                        } else {
+                            iErr |= JPEGDecodeMCU(pJPEG, iK | iSkipMask, &iDCPred3);
+                        }
+                        if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
+                        {
+                            c = ucRangeTable[((iDCPred3 * iQuant4) >> 5) & 0x3ff];
+                            l = c | ((uint32_t) c << 8) | ((uint32_t) c << 16) | ((uint32_t) c << 24);
+                            // dct stores byte values
+                            pl = (uint32_t *)&pJPEG->sMCUs[iK];
+                            for (i = 0; i<iMaxFill; i++) // 8x8 bytes = 16 longs
+                                pl[i] = l;
+                        }
+                        else
+                        {
+                            JPEGIDCT(pJPEG, iK, pJPEG->JPCI[3].quant_tbl_no);
+                        }
                     }
                 }
             } // if color components present
             if (!iSkipMask) { // this MCU is not skipped
-                if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
+                if (pJPEG->ucNumComponents == 4) {
+                    JPEGPutMCU4Color(pJPEG, xoff, iPitch); // CMYK/YCCK -> RGB or grayscale
+                } else if (pJPEG->ucNumComponents == 2 && pJPEG->ucPixelType < EIGHT_BIT_GRAYSCALE) {
+                    JPEGPutMCUGrayAlpha(pJPEG, xoff, iPitch); // gray+alpha -> RGB(A)
+                } else if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
                     JPEGPutMCU8BitGray(pJPEG, xoff, iPitch); // grayscale or color is being drawn as grayscale
                 } else {
                     switch (pJPEG->ucSubSample) {
@@ -5415,7 +5893,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                 if (--pJPEG->iResCount == 0)
                 {
                     pJPEG->iResCount = pJPEG->iResInterval;
-                    iDCPred0 = iDCPred1 = iDCPred2 = 0; // reset DC predictors
+                    iDCPred0 = iDCPred1 = iDCPred2 = iDCPred3 = 0; // reset DC predictors
                     if (pJPEG->bb.ulBitOff & 7) // need to start at the next even byte
                     {
                         pJPEG->bb.ulBitOff += (8 - (pJPEG->bb.ulBitOff & 7));  // new restart interval starts on byte boundary
