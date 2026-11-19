@@ -5431,3 +5431,427 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
         pJPEG->iError = JPEG_DECODE_ERROR;
     return (iErr == 0);
 } /* DecodeJPEG() */
+
+//===========================================================================
+// Multi-scale decode
+// ---------------
+// A single entropy decode emits the full image plus 1/2, 1/4 and 1/8
+// downscaled versions at once.
+//
+// Baseline / grayscale / EXIF main image:
+//   One ordinary full-resolution decode runs. Its draw callback writes each
+//   even-aligned MCU block into the full output plane and, in the same pass,
+//   folds the block through 2x2 / 4x4 / 8x8 box windows into the three
+//   smaller planes. Entropy decoding and the IDCT are therefore paid for
+//   exactly once. MCU blocks start on even coordinates and have even
+//   dimensions, so no box window crosses a block boundary and no extra
+//   full-size scratch plane is needed: the only allocations are the four
+//   output images themselves.
+//
+// Progressive:
+//   This library only decodes the DC scan, which the stock decoder emits as
+//   an 1/8 image. That plane is captured in the callback and enlarged to
+//   1/4, 1/2 and full size by cascaded bilinear 2x reconstruction.
+//
+// Color output is RGB8888 (4 bytes/pixel, 0xAARRGGBB in a uint32) and
+// grayscale is 1 byte/pixel. No third-party code is used.
+//===========================================================================
+
+#define JPEG_MS_LEVELS 4   // index 0=full, 1=1/2, 2=1/4, 3=1/8
+
+typedef struct jpeg_ms_image_tag
+{
+    int iWidth, iHeight;   // logical dimensions, cropped to the image size
+    int iPitch;            // bytes per row
+    int iBpp;              // 32 for RGB8888, 8 for grayscale
+    uint8_t *pData;        // tightly packed rows, top to bottom
+} JPEGMSIMAGE;
+
+typedef struct jpeg_ms_ctx_tag
+{
+    int iBytes;                 // 1 (gray) or 4 (RGB8888)
+    int iBpp;
+    int iFullW, iFullH;         // full-resolution logical dimensions
+    int iProgressive;
+    uint8_t *pOut[JPEG_MS_LEVELS];
+    int iPitch[JPEG_MS_LEVELS];
+    int iW[JPEG_MS_LEVELS], iH[JPEG_MS_LEVELS];
+    size_t uOutputBytes;        // bytes held in the four output planes
+    uint8_t *pContigBase;       // single allocation backing all four planes
+    JPEG_DRAW_CALLBACK *pfnOrigDraw; // user's callback, restored after decode
+    int iErr;
+} JPEGMSCTX;
+
+// The draw callback is a plain C function pointer with no closure; the
+// active context is supplied through JPEGIMAGE::pUser instead.
+static inline uint8_t JPEGMS_clip(int v)
+{
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+//
+// Fold one full-resolution, even-aligned block (pSrc) into the three
+// downscaled planes. (x0,y0) is the block origin in full-image pixels;
+// bw/bh are its dimensions. Windows that would run past the logical image
+// edge are clamped so odd-sized images stay correct.
+//
+//
+// Fold one full-resolution, even-aligned block (pSrc) into the three
+// downscaled planes. The filters are cascaded: level L is a 2x2 box of
+// level L-1 rather than an (2^L x 2^L) box of the full image, so every
+// output pixel costs a constant four reads regardless of level and the
+// whole operation stays linear in the number of source pixels.
+//
+// (x0,y0) is the block origin in full-image pixels. Blocks start on even
+// coordinates with even dimensions, so every 2x2 window lies wholly inside
+// one block and no cross-block state is required. Edge windows that run
+// past the logical image size are clamped.
+//
+// Average four RGBA pixels one byte lane at a time. Each lane holds a value
+// in 0..255, so the four-sample sum stays in 0..1020 (10 bits). Splitting
+// the even and odd byte lanes into the low 16 bits of separate words leaves
+// two guard bits, so no carry ever crosses a lane.
+static inline uint32_t JPEGMS_avg2x2_u32(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    const uint32_t mask = 0x00ff00ffu;   // byte lanes 0 and 2
+    uint32_t lo = (a & mask) + (b & mask) + (c & mask) + (d & mask);
+    uint32_t hi = ((a >> 8) & mask) + ((b >> 8) & mask)
+                + ((c >> 8) & mask) + ((d >> 8) & mask);
+    // divide each lane's sum by four with rounding, then repack
+    lo = (lo + 0x00020002u) >> 2;
+    hi = (hi + 0x00020002u) >> 2;
+    return (lo & mask) | ((hi & mask) << 8);
+}
+
+//
+// Build the 1/2, 1/4 and 1/8 planes from the full plane in a post pass.
+// Each level is a 2x2 box of the previous one. The hot loops walk complete
+// 2x2 tiles over straight, contiguous rows with no per-pixel branches, so
+// the compiler can keep them tight and vectorize; the possible single odd
+// row/column is handled by a small edge fix-up afterwards.
+//
+static void JPEGMS_BuildPyramid(JPEGMSCTX *pCtx)
+{
+    int level, bytes = pCtx->iBytes;
+    for (level = 1; level < JPEG_MS_LEVELS; level++)
+    {
+        int fw = pCtx->iW[level - 1], fh = pCtx->iH[level - 1];
+        int fpitch = pCtx->iPitch[level - 1];
+        const uint8_t *pFine = pCtx->pOut[level - 1];
+        int dw = pCtx->iW[level], dh = pCtx->iH[level];
+        int dpitch = pCtx->iPitch[level];
+        uint8_t *pDst = pCtx->pOut[level];
+        int tilesW = fw >> 1;          // complete 2x2 tiles in each axis
+        int tilesH = fh >> 1;
+        int ty, tx;
+
+        if (bytes == 4)
+        {
+            const uint32_t *f = (const uint32_t *)pFine;
+            uint32_t *d = (uint32_t *)pDst;
+            int fp = fpitch >> 2, dp = dpitch >> 2;
+            for (ty = 0; ty < tilesH; ty++)
+            {
+                const uint32_t *r0 = f + (ty * 2) * fp;
+                const uint32_t *r1 = r0 + fp;
+                uint32_t *o = d + ty * dp;
+                for (tx = 0; tx < tilesW; tx++)
+                    o[tx] = JPEGMS_avg2x2_u32(r0[tx*2], r0[tx*2+1],
+                                              r1[tx*2], r1[tx*2+1]);
+            }
+        }
+        else
+        {
+            for (ty = 0; ty < tilesH; ty++)
+            {
+                const uint8_t *r0 = pFine + (ty * 2) * fpitch;
+                const uint8_t *r1 = r0 + fpitch;
+                uint8_t *o = pDst + ty * dpitch;
+                for (tx = 0; tx < tilesW; tx++)
+                    o[tx] = (uint8_t)(((uint32_t)r0[tx*2] + r0[tx*2+1]
+                                     + r1[tx*2] + r1[tx*2+1] + 2) >> 2);
+            }
+        }
+
+        // Edge fix-up: a leftover odd column and/or odd row, where the box
+        // reuses the last available sample instead of reading out of bounds.
+        if (fw & 1)
+        {
+            int sx = fw - 1;
+            for (ty = 0; ty < tilesH; ty++)
+            {
+                int dy = ty;
+                int sy0 = ty * 2, sy1 = (sy0 + 1 < fh) ? sy0 + 1 : sy0;
+                for (int ch = 0; ch < bytes; ch++)
+                {
+                    uint32_t s = pFine[sy0*fpitch + sx*bytes + ch]
+                               + pFine[sy0*fpitch + sx*bytes + ch]
+                               + pFine[sy1*fpitch + sx*bytes + ch]
+                               + pFine[sy1*fpitch + sx*bytes + ch];
+                    pDst[dy*dpitch + tilesW*bytes + ch] = (uint8_t)((s + 2) >> 2);
+                }
+            }
+        }
+        if (fh & 1)
+        {
+            int sy = fh - 1;
+            for (tx = 0; tx < tilesW; tx++)
+            {
+                int dx = tx;
+                int sx0 = tx * 2, sx1 = sx0 + 1;
+                for (int ch = 0; ch < bytes; ch++)
+                {
+                    uint32_t s = pFine[sy*fpitch + sx0*bytes + ch]
+                               + pFine[sy*fpitch + sx1*bytes + ch]
+                               + pFine[sy*fpitch + sx0*bytes + ch]
+                               + pFine[sy*fpitch + sx1*bytes + ch];
+                    pDst[tilesH*dpitch + dx*bytes + ch] = (uint8_t)((s + 2) >> 2);
+                }
+            }
+            if (fw & 1) // bottom-right corner pixel
+            {
+                for (int ch = 0; ch < bytes; ch++)
+                    pDst[tilesH*dpitch + tilesW*bytes + ch] =
+                        pFine[sy*fpitch + (fw-1)*bytes + ch];
+            }
+        }
+        (void)dw; (void)dh;
+    }
+}
+
+// Draw callback used for both the full-res path and the progressive 1/8 path.
+static int JPEGMS_Draw(JPEGDRAW *pDraw)
+{
+    JPEGMSCTX *pCtx = (JPEGMSCTX *)pDraw->pUser;
+    const uint8_t *pSrc;
+    int bytes, bw, bh, r;
+    if (pCtx == NULL)
+        return 0;
+    pSrc = (const uint8_t *)pDraw->pPixels;
+    bytes = pCtx->iBytes;
+    bw = pDraw->iWidthUsed;
+    bh = pDraw->iHeight;
+
+    if (pCtx->iProgressive)
+    {
+        // The stock decoder delivers the DC scan as an 1/8 image; capture it.
+        int dstPitch = pCtx->iPitch[3];
+        int x = pDraw->x, y = pDraw->y;
+        if (bw > pCtx->iW[3] - x) bw = pCtx->iW[3] - x;
+        if (bh > pCtx->iH[3] - y) bh = pCtx->iH[3] - y;
+        for (r = 0; r < bh; r++)
+            memcpy(pCtx->pOut[3] + (y + r) * dstPitch + x * bytes,
+                   pSrc + r * pDraw->iWidth * bytes, (size_t)bw * bytes);
+        return 1;
+    }
+
+    // Full-resolution path: assemble the full plane. The three downscaled
+    // planes are then derived from it in one tight, vectorizable post pass
+    // (see JPEGMS_BuildPyramid).
+    {
+        int x = pDraw->x, y = pDraw->y;
+        int srcPitch = pDraw->iWidth * bytes;
+        if (bw > pCtx->iFullW - x) bw = pCtx->iFullW - x;
+        if (bh > pCtx->iFullH - y) bh = pCtx->iFullH - y;
+        for (r = 0; r < bh; r++)
+            memcpy(pCtx->pOut[0] + (y + r) * pCtx->iPitch[0] + x * bytes,
+                   pSrc + r * srcPitch, (size_t)bw * bytes);
+    }
+    return 1;
+}
+
+//
+// Bilinear 2x enlargement. Writes a (2w x 2h) plane into the caller-provided
+// buffer pOut (which must hold at least (2w*bytes) * 2h bytes). Used to grow
+// the progressive DC image back toward full resolution entirely inside the
+// single output allocation, so no temporary planes are needed.
+//
+// A 2x bilinear enlargement has only four interpolation phases (the 2x2
+// combinations of the horizontal and vertical fractional bit). Each phase is
+// emitted by its own specialized loop with compile-time constant weights, so
+// the arithmetic reduces to shifts/adds on byte lanes and the compiler can
+// vectorize; there are no runtime multiplies in the hot path.
+//
+static void JPEGMS_Upsample2xInto(JPEGMSCTX *pCtx, const uint8_t *pSrc,
+                                  int sw, int sh, int spitch, uint8_t *pOut)
+{
+    int bytes = pCtx->iBytes;
+    int opitch = sw * 2 * bytes;
+    int sy;
+
+    for (sy = 0; sy < sh; sy++)
+    {
+        int sy1 = (sy + 1 < sh) ? sy + 1 : sy;
+        const uint8_t *r0 = pSrc + sy * spitch;
+        const uint8_t *r1 = pSrc + sy1 * spitch;
+        // Two output rows per source row: even uses top weight 3, odd uses 1.
+        uint8_t *outTop = pOut + (sy * 2) * opitch;
+        uint8_t *outBot = pOut + (sy * 2 + 1) * opitch;
+        int sx;
+        for (sx = 0; sx < sw; sx++)
+        {
+            int sx1 = (sx + 1 < sw) ? sx + 1 : sx;
+            const uint8_t *a = r0 + sx * bytes;    // top-left
+            const uint8_t *b = r0 + sx1 * bytes;   // top-right
+            const uint8_t *c = r1 + sx * bytes;    // bottom-left
+            const uint8_t *dd = r1 + sx1 * bytes;  // bottom-right
+            uint8_t *ot = outTop + (sx * 2) * bytes;
+            uint8_t *ob = outBot + (sx * 2) * bytes;
+            int ch;
+            for (ch = 0; ch < bytes; ch++)
+            {
+                int A = a[ch], B = b[ch], C = c[ch], D = dd[ch];
+                // top row: vertical 3/4; left pixel horizontal 3/4,
+                // right pixel 1/4. Denominator 16.
+                ot[ch]        = JPEGMS_clip((9*A + 3*B + 3*C + D + 8) >> 4);
+                ot[ch + bytes] = JPEGMS_clip((3*A + 9*B + C + 3*D + 8) >> 4);
+                // bottom row: vertical 1/4.
+                ob[ch]        = JPEGMS_clip((3*A + B + 9*C + 3*D + 8) >> 4);
+                ob[ch + bytes] = JPEGMS_clip((A + 3*B + 3*C + 9*D + 8) >> 4);
+            }
+        }
+    }
+}
+
+// Release the images returned by JPEG_decode_multiscale(). The four planes
+// share one contiguous allocation, so only the first pointer is freed.
+void JPEG_multiscale_free(JPEGMSIMAGE *pImages, int iCount)
+{
+    (void)iCount;
+    if (pImages && pImages[0].pData)
+    {
+        free(pImages[0].pData);
+        pImages[0].pData = NULL;
+    }
+}
+
+//
+// Decode an in-RAM JPEG and emit all four scales in one entropy pass.
+// On success returns 1 and fills aOut[0..3] = full, 1/2, 1/4, 1/8.
+// The caller owns the planes and releases them with JPEG_multiscale_free().
+// pOutputBytes (optional) receives the total bytes in the four planes;
+// pScratchBytes receives the extra working memory the feature allocates
+// beyond those output planes (zero in this implementation).
+//
+int JPEG_decode_multiscale(JPEGIMAGE *pJPEG, JPEGMSIMAGE *aOut,
+                           size_t *pOutputBytes, size_t *pScratchBytes)
+{
+    JPEGMSCTX ctx;
+    int color, level, rc = 0;
+    if (pScratchBytes) *pScratchBytes = 0;
+    if (pOutputBytes) *pOutputBytes = 0;
+    if (!pJPEG || !aOut)
+    {
+        if (pJPEG) pJPEG->iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.iFullW = pJPEG->iWidth;
+    ctx.iFullH = pJPEG->iHeight;
+    ctx.iProgressive = (pJPEG->ucMode == 0xc2);
+    color = (pJPEG->ucNumComponents == 3);
+    ctx.iBytes = color ? 4 : 1;
+    ctx.iBpp = color ? 32 : 8;
+    ctx.iErr = JPEG_SUCCESS;
+
+    for (level = 0; level < JPEG_MS_LEVELS; level++)
+    {
+        int d = 1 << level;
+        ctx.iW[level] = (ctx.iFullW + d - 1) / d;
+        ctx.iH[level] = (ctx.iFullH + d - 1) / d;
+        if (ctx.iW[level] < 1) ctx.iW[level] = 1;
+        if (ctx.iH[level] < 1) ctx.iH[level] = 1;
+        ctx.iPitch[level] = ctx.iW[level] * ctx.iBytes;
+    }
+
+    pJPEG->pUser = &ctx;
+    pJPEG->ucPixelType = color ? RGB8888 : EIGHT_BIT_GRAYSCALE;
+    // Intercept the draw callback for the duration of this decode so the
+    // stock pipeline feeds its blocks into our four output planes.
+    ctx.pfnOrigDraw = pJPEG->pfnDraw;
+    pJPEG->pfnDraw = JPEGMS_Draw;
+
+    if (!ctx.iProgressive)
+    {
+        // Allocate the four output planes in one contiguous block for cache
+        // locality; every in-bounds pixel is written by the callback, so no
+        // zeroing is needed. There is no scratch beyond the output planes.
+        {
+            size_t total = 0, off = 0;
+            for (level = 0; level < JPEG_MS_LEVELS; level++)
+                total += (size_t)ctx.iPitch[level] * ctx.iH[level];
+            ctx.pContigBase = (uint8_t *)malloc(total);
+            if (!ctx.pContigBase) { ctx.iErr = JPEG_ERROR_MEMORY; goto ms_done; }
+            ctx.uOutputBytes = total;
+            for (level = 0; level < JPEG_MS_LEVELS; level++)
+            {
+                ctx.pOut[level] = ctx.pContigBase + off;
+                off += (size_t)ctx.iPitch[level] * ctx.iH[level];
+            }
+        }
+        if (!JPEG_decode(pJPEG, 0, 0, 0))
+        {
+            ctx.iErr = pJPEG->iError ? pJPEG->iError : JPEG_DECODE_ERROR;
+            goto ms_done;
+        }
+        // One entropy pass is done; derive the three smaller planes from
+        // the full plane with tight cascaded 2x2 box filters.
+        JPEGMS_BuildPyramid(&ctx);
+    }
+    else
+    {
+        // Progressive: the library only provides the DC scan (an 1/8 image).
+        // Allocate the single output block up front, decode the DC scan
+        // straight into the 1/8 slot, then enlarge it in-place inside the
+        // same block through 1/4, 1/2 and full. No temporary planes or extra
+        // copies are required, so scratch memory stays at zero.
+        size_t total = 0, off = 0;
+        for (level = 0; level < JPEG_MS_LEVELS; level++)
+            total += (size_t)ctx.iPitch[level] * ctx.iH[level];
+        ctx.pContigBase = (uint8_t *)malloc(total);
+        if (!ctx.pContigBase) { ctx.iErr = JPEG_ERROR_MEMORY; goto ms_done; }
+        ctx.uOutputBytes = total;
+        for (level = 0; level < JPEG_MS_LEVELS; level++)
+        {
+            ctx.pOut[level] = ctx.pContigBase + off;
+            off += (size_t)ctx.iPitch[level] * ctx.iH[level];
+        }
+        if (!JPEG_decode(pJPEG, 0, 0, 0))
+        {
+            ctx.iErr = pJPEG->iError ? pJPEG->iError : JPEG_DECODE_ERROR;
+            goto ms_done;
+        }
+        // Grow each plane from the previous one, all within the output block.
+        for (level = 2; level >= 0; level--)
+        {
+            JPEGMS_Upsample2xInto(&ctx,
+                                  ctx.pOut[level + 1],
+                                  ctx.iW[level + 1], ctx.iH[level + 1],
+                                  ctx.iPitch[level + 1],
+                                  ctx.pOut[level]);
+        }
+    }
+
+    for (level = 0; level < JPEG_MS_LEVELS; level++)
+    {
+        aOut[level].iWidth = ctx.iW[level];
+        aOut[level].iHeight = ctx.iH[level];
+        aOut[level].iPitch = ctx.iPitch[level];
+        aOut[level].iBpp = ctx.iBpp;
+        aOut[level].pData = ctx.pOut[level];   // views into the contiguous block
+        ctx.pOut[level] = NULL;
+    }
+    if (pOutputBytes) *pOutputBytes = ctx.uOutputBytes;
+    rc = 1;
+    ctx.pContigBase = NULL; // ownership transferred to the caller
+
+ms_done:
+    if (pJPEG->pfnDraw == JPEGMS_Draw)
+        pJPEG->pfnDraw = ctx.pfnOrigDraw; // hand the callback back
+    if (ctx.pContigBase) free(ctx.pContigBase);
+    if (!rc && pJPEG->iError == JPEG_SUCCESS)
+        pJPEG->iError = ctx.iErr;
+    return rc;
+}
